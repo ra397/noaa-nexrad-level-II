@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <script async src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.19.7/proj4.min.js"></script>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDgaNWOMekRyGIxLp4WBm1RFHoLQOOkSvc&libraries=places,marker,drawing,geometry"></script>
+    <script src="https://s-iihr72.iihr.uiowa.edu/modular/nwcm/js/customOverlay.js"></script>
+    <script defer  type="text/javascript" src="help.js"></script>
+    <script src="map.constants.js"></script>
+    <title>RadarGl.radar.map</title>
+    <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+</head>
+<style>
+    html,
+    body {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        font-family: Arial, Helvetica, sans-serif;
+        font-size: 13px;
+        overflow: hidden;
+    }
+    #map {
+        height: 100%;
+    }
+    #loading {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        background: rgba(0,0,0,0.8);
+        color: white;
+        padding: 10px;
+        border-radius: 5px;
+        z-index: 1000;
+        display: none;
+    }
+</style>
+<body>
+    <div id="map"></div>
+    <div id="loading">Loading radar data...</div>
+</body>
+</html>
+
+
+<script id="shaders">
+    const VERTEX_PRECISION = 'highp'
+    const SHADER_PRECISION = 'lowp'
+
+    const vsSource = `#version 300 es
+precision highp float;
+
+in float a_azimuth;
+in float a_distance;
+in float a_triangleColorIndex;
+
+uniform vec2 u_origin;
+uniform vec2 u_boundsMin;
+uniform vec2 u_boundsMax;
+
+flat out int v_colorIndex;
+
+void main() {
+    float angle = radians(a_azimuth);
+    float x = cos(angle) * a_distance + u_origin.x;
+    float y = sin(angle) * a_distance + u_origin.y;
+
+    float ndc_x = 2.0 * (x - u_boundsMin.x) / (u_boundsMax.x - u_boundsMin.x) - 1.0;
+    float ndc_y = 2.0 * (y - u_boundsMin.y) / (u_boundsMax.y - u_boundsMin.y) - 1.0;
+
+    gl_Position = vec4(ndc_x, ndc_y, 0.0, 1.0);
+    v_colorIndex = int(a_triangleColorIndex);
+}
+`
+    const fsSource = `#version 300 es
+precision highp float;
+
+flat in int v_colorIndex;
+uniform vec3 u_colors[255];
+
+out vec4 outColor;
+
+void main() {
+    vec3 color = u_colors[v_colorIndex];
+    // Discard black (0,0,0) pixels
+    if (color.r == 0.0 && color.g == 0.0 && color.b == 0.0) {
+        discard;
+    }
+    outColor = vec4(color, 1.0);
+}
+`;
+</script>
+<script id="webgLRadarOverlay">
+    class WebGLCanvasOverlay extends google.maps.OverlayView {
+
+        constructor(map, onReady) {
+            super();
+            this.map = map;
+            this.setMap(map);
+            this.scale = 1
+            this.canvas = document.createElement("canvas");
+            this.canvas.style.position = "absolute";
+            this.canvas.style.backgroundColor = "transparent";
+            this.gl = this.canvas.getContext("webgl2", { alpha: true, preserveDrawingBuffer: true });
+
+            this.radarLatLng = new google.maps.LatLng(0, 0);
+            this.mercatorBounds = {xMin: 0, xMax: 1, yMin: 0, yMax: 1};
+            this.mercatorXY = {x:0,y:0};
+            this.onReady = onReady;
+        }
+        onAdd() {
+            const panes = this.getPanes();
+            panes.overlayLayer.appendChild(this.canvas);
+            this.radar = new GlRadar(this.gl);
+            if (this.onReady) this.onReady(this.radar);
+        }
+        draw() {
+            const bounds = this.map.getBounds();
+            const overleyProjection = this.getProjection();
+            if (!overleyProjection || !this.radar) return;
+
+            const px_sw = overleyProjection.fromLatLngToDivPixel (bounds.getSouthWest());
+            const px_ne = overleyProjection.fromLatLngToDivPixel (bounds.getNorthEast());
+            this.width = Math.abs(px_ne.x - px_sw.x);
+            this.height = Math.abs(px_sw.y - px_ne.y);
+            this.left = `${Math.round(px_sw.x)}px`;
+            this.top = `${Math.round(px_ne.y)}px`;
+
+            if (this.canvas.width !== this.width  || this.canvas.height !== this.height) {
+                this.gl.viewport(0, 0, this.width , this.height);
+                this.canvas.width = this.width ;
+                this.canvas.height = this.height;
+            }
+
+            this.canvas.style.left =  this.left;
+            this.canvas.style.top =  this.top;
+
+            const me_sw = toMercator (bounds.getSouthWest().toJSON());
+            const me_ne = toMercator (bounds.getNorthEast().toJSON());
+            const me_radar = toMercator(this.radarLatLng.toJSON());
+
+            this.mercatorXY = {x: (me_radar.x), y: me_radar.y}
+            this.mercatorBounds = {xMin: me_sw.x, xMax: me_ne.x, yMin: me_sw.y, yMax: me_ne.y};
+
+            this.radar.setOrigin(this.mercatorXY.x, this.mercatorXY.y);
+            this.radar.setBounds(this.mercatorBounds.xMin, this.mercatorBounds.yMin, this.mercatorBounds.xMax, this.mercatorBounds.yMax);
+            if (this?.radar) this.radar.draw()
+        }
+        onRemove() {
+            this.canvas.remove();
+        }
+        setRadarPosition(lat, lng) {
+            this.radarLatLng = new google.maps.LatLng(lat, lng);
+            const me_radar = toMercator(this.radarLatLng.toJSON());
+            this.radarLatLng = new google.maps.LatLng(lat, lng);
+            this.mercatorXY = {x: me_radar.x, y: me_radar.y}
+        }
+    }
+</script>
+<script id="ll2web">
+    function toMercator({lng, lat}) {
+        const RADIUS = 6378137;
+        const RAD =  Math.PI / 180
+        const x = RADIUS * lng * RAD;
+        const y = RADIUS * Math.log(Math.tan(Math.PI / 4 + lat * RAD / 2));
+        return {x: x, y:y};
+    }
+</script>
+<script id="GlRadarClass">
+    function GlRadar(gl, use_example = false) {
+        this.gl = gl;
+        this.gl.disable(this.gl.BLEND);
+        this.gl.getExtension('OES_element_index_uint')
+        this.colors = [];
+        this.bounds = [];
+        this.origin = [];
+
+        this.program = createProgram(gl, vsSource, fsSource);
+        this.gl.useProgram(this.program);
+
+        this.azimuths = [];
+        this.distances = [];
+        this.bufferIndices = [];
+
+        this.gateLength = .25;
+        this.unitScale = 1000;
+        this.maxGate = 230
+        this.initialAz = 90
+        this.beamWidth = .5
+        this.maxAzim = 360
+
+        // NEW METHOD: Load processed radar data from JSON
+        this.loadProcessedData = (data) => {
+            const prof0 = performance.now();
+            
+            console.log('Loading processed radar data...');
+            console.log('Metadata:', data.metadata);
+            
+            // Convert arrays from JSON back to typed arrays
+            this.azimuths = new Float32Array(data.azimuths);
+            this.distances = new Float32Array(data.distances);
+            this.triClrIIx = new Uint8Array(data.colorIndices);
+            this.bufferIndices = new Int32Array(data.triangleIndices);
+            
+            const prof1 = performance.now();
+            console.log('Data conversion time:', prof1 - prof0, 'ms');
+            
+            // Bind attributes to WebGL
+            bindAttribute(this.azimuths, "a_azimuth");
+            bindAttribute(this.distances, "a_distance");
+            bindAttribute(this.triClrIIx, "a_triangleColorIndex");
+
+            // Create and bind index buffer
+            const indexBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(this.bufferIndices), gl.STATIC_DRAW);
+            
+            const prof2 = performance.now();
+            console.log('WebGL buffer setup time:', prof2 - prof1, 'ms');
+            console.log('Total loading time:', prof2 - prof0, 'ms');
+            
+            return true;
+        };
+
+        this.example = () => {
+            const prof0 = performance.now();
+            const ngates = this.maxGate/this.gateLength ;
+            const nazimuths = this.maxAzim/this.beamWidth ;
+            const vertexTotal = (nazimuths + 1) * (ngates + 1);
+            this.azimuths  = new Float32Array(vertexTotal);
+            this.distances = new Float32Array(vertexTotal);
+            this.triClrIIx = new Uint8Array(vertexTotal);
+            this.bufferIndices = new Int32Array(6 * ngates * nazimuths);
+            var ix = -1
+// generate Vertices
+            for (let a = 0; a <= nazimuths; a++) {
+                for (let g = 0; g <= ngates; g++) {
+                    ix++;
+                    this.azimuths[ix] = a * this.beamWidth - this.beamWidth/2;
+                    this.distances[ix] = g * this.gateLength * this.unitScale || 100;
+                    // this.triClrIIx.push(Math.random() * 3);
+                }
+            }
+            const prof1 = performance.now();
+            console.log('vertix preparation', prof1 - prof0 )
+// Define Quads/Triangles with precalculated Vertices
+            var bA0, bA1, tA0, tA1;
+            const clrLen = this.colors.length
+            ix = 0
+            for (let a = 0; a < nazimuths; a++) {
+                var offset = a * (ngates + 1);
+                for (let g = 0; g < ngates; g++) {
+                    bA0 = g + offset;
+                    tA0 = bA0 + 1;
+                    bA1 = g + offset + ngates + 1;
+                    tA1 = g + offset + ngates + 2;
+                    if (this.bufferIndices.length  > ix) {
+                        this.bufferIndices.set(
+                            [
+                                bA0, tA0, bA1,
+                                tA0, tA1, bA1
+                            ], ix
+                        );
+                    }
+                    ix += 6;
+                    clr = Math.random() * clrLen;
+                    this.triClrIIx[bA0] = clr
+                    this.triClrIIx[bA1] = clr
+                    this.triClrIIx[tA0] = clr
+                    this.triClrIIx[tA1] = clr
+                }
+            }
+            const prof2 = performance.now();
+            console.log('quad/triangle ready', prof2 - prof1 )
+// Bind attributes
+            bindAttribute(this.azimuths, "a_azimuth");
+            bindAttribute(this.distances, "a_distance");
+            bindAttribute(this.triClrIIx, "a_triangleColorIndex");
+
+            const indexBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(this.bufferIndices), gl.STATIC_DRAW);
+            const prof3 = performance.now();
+            console.log('buffers ready ready', prof3 - prof2 )
+            console.log('Preparing radar time', prof3 - prof0 )
+            this.draw()
+        };
+
+        if (use_example) this.example();
+        
+        function createProgram(gl, vsSource, fsSource) {
+            function compileShader(type, source) {
+                const shader = gl.createShader(type);
+                gl.shaderSource(shader, source);
+                gl.compileShader(shader);
+                if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                    console.error("Shader compile error:", gl.getShaderInfoLog(shader));
+                    gl.deleteShader(shader);
+                    return null;
+                }
+                return shader;
+            }
+
+            const vertexShader = compileShader(gl.VERTEX_SHADER, vsSource);
+            const fragmentShader = compileShader(gl.FRAGMENT_SHADER, fsSource);
+
+            const program = gl.createProgram();
+            gl.attachShader(program, vertexShader);
+            gl.attachShader(program, fragmentShader);
+            gl.linkProgram(program);
+
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error("Program link error:", gl.getProgramInfoLog(program));
+                return null;
+            }
+
+            return program;
+        }
+        const bindAttribute = (data, name, size = 1) => {
+            const loc = gl.getAttribLocation(this.program, name);
+            const buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+            gl.enableVertexAttribArray(loc);
+            gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+
+        };
+
+        this.setColors = (colors) => {
+            this.colors = colors;
+            const loc = gl.getUniformLocation(this.program, "u_colors");
+            gl.uniform3fv(loc, new Float32Array(colors.flat()));
+        };
+
+        this.setBounds = (minX, minY, maxX, maxY) => {
+            this.bounds = [minX, minY, maxX, maxY];
+            gl.uniform2f(gl.getUniformLocation(this.program, "u_boundsMin"), minX, minY);
+            gl.uniform2f(gl.getUniformLocation(this.program, "u_boundsMax"), maxX, maxY);
+        };
+
+        this.setOrigin = (x, y) => {
+            this.origin = [x,y];
+            gl.uniform2f(gl.getUniformLocation(this.program, "u_origin"), x, y);
+        };
+
+        this.draw = () => {
+            const prof0 = performance.now() ;
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            this.gl.drawElements(gl.TRIANGLES, this.bufferIndices.length, gl.UNSIGNED_INT, 0);
+            const prof1 = performance.now() ;
+            console.log("Drawing time", prof1 - prof0, 'milliseconds');
+        };
+    }
+
+</script>
+
+<script id="useCase">
+    var map, overlay, radar;
+    const map_div = document.getElementById('map');
+    const loading_div = document.getElementById('loading');
+    
+    // Configuration - CHANGE THESE PATHS/COORDINATES FOR YOUR DATA
+    const RADAR_DATA_URL = 'radar_data.json';  // Path to your JSON file
+    const RADAR_LAT = 39.7867;   // Your radar's latitude
+    const RADAR_LNG = -104.5458;  // Your radar's longitude
+    const USE_EXAMPLE_DATA = false;  // Set to true to use synthetic data instead
+    
+    const use_center = {
+        lat: 42.26,
+        lng: -92.87
+    };
+
+    async function loadRadarData(url) {
+        try {
+            loading_div.style.display = 'block';
+            console.log(`Loading radar data from: ${url}`);
+            
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            
+            const data = await response.json();
+            console.log('Radar data loaded successfully');
+            console.log('Data summary:', data.metadata);
+            
+            loading_div.style.display = 'none';
+            return data;
+            
+        } catch (error) {
+            console.error('Error loading radar data:', error);
+            loading_div.innerHTML = `Error loading radar data: ${error.message}`;
+            setTimeout(() => {
+                loading_div.style.display = 'none';
+            }, 5000);
+            throw error;
+        }
+    }
+
+    function init () {
+        map = new google.maps.Map(map_div, {
+            center: { lat: 42, lng: -92 }, // Iowa City
+            zoom: 7,
+        });
+
+        // Create color palette (same as before)
+        some_colors = []
+        for (var i = 1; i < 255; i++) {
+            if (i < 128) {
+                color = [1/i, 2*i/128, 0]
+            } else {
+                color = [0, i/16, i/255]
+            }
+            some_colors.push(color);
+        }
+
+        overlay = new WebGLCanvasOverlay(
+            map, async (r) => {
+                radar = r;
+                radar.setColors(some_colors);
+                overlay.setRadarPosition(RADAR_LAT, RADAR_LNG);
+                
+                if (USE_EXAMPLE_DATA) {
+                    // Use synthetic example data
+                    console.log('Using synthetic example data');
+                    radar.example();
+                } else {
+                    // Load real radar data
+                    try {
+                        const radarData = await loadRadarData(RADAR_DATA_URL);
+                        radar.loadProcessedData(radarData);
+                        radar.draw();
+                        console.log('Real radar data loaded and rendered successfully');
+                    } catch (error) {
+                        console.log('Falling back to example data due to error');
+                        radar.example();
+                    }
+                }
+            }
+        );
+
+        map.setCenter({
+            "lat": 41.99698857047661,
+            "lng": -91.975855768333
+        });
+
+        map.setZoom(7);
+    }
+
+    window.addEventListener('load', init, {once: true})
+
+</script>
